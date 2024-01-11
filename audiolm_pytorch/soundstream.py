@@ -1,13 +1,12 @@
 import functools
-from itertools import cycle
 from pathlib import Path
-
 from functools import partial, wraps
-from itertools import zip_longest
-from typing import Optional
+from itertools import cycle, zip_longest
+from typing import Optional, List
 
 import torch
 from torch import nn, einsum
+from torch.nn import Module, ModuleList
 from torch.autograd import grad as torch_grad
 import torch.nn.functional as F
 from torch.linalg import vector_norm
@@ -17,10 +16,16 @@ from torchaudio.functional import resample
 
 from einops import rearrange, reduce, pack, unpack
 
-from vector_quantize_pytorch import GroupedResidualVQ
+from vector_quantize_pytorch import (
+    GroupedResidualVQ,
+    GroupedResidualLFQ,
+    GroupedResidualFSQ
+)
 
 from local_attention import LocalMHA
 from local_attention.transformer import FeedForward, DynamicPositionBias
+
+from gateloop_transformer import SimpleGateLoopLayer as GateLoop
 
 from audiolm_pytorch.utils import curtail_to_multiple
 
@@ -83,7 +88,7 @@ def Sequential(*mods):
 
 # discriminators
 
-class MultiScaleDiscriminator(nn.Module):
+class MultiScaleDiscriminator(Module):
     def __init__(
         self,
         channels = 16,
@@ -94,7 +99,7 @@ class MultiScaleDiscriminator(nn.Module):
     ):
         super().__init__()
         self.init_conv = nn.Conv1d(input_channels, channels, 15, padding = 7)
-        self.conv_layers = nn.ModuleList([])
+        self.conv_layers = ModuleList([])
 
         curr_channels = channels
 
@@ -136,7 +141,7 @@ class MultiScaleDiscriminator(nn.Module):
 # autoregressive squeeze excitation
 # https://arxiv.org/abs/1709.01507
 
-class SqueezeExcite(nn.Module):
+class SqueezeExcite(Module):
     def __init__(self, dim, reduction_factor = 4, dim_minimum = 8):
         super().__init__()
         dim_inner = max(dim_minimum, dim // reduction_factor)
@@ -164,7 +169,7 @@ class SqueezeExcite(nn.Module):
 
 # complex stft discriminator
 
-class ModReLU(nn.Module):
+class ModReLU(Module):
     """
     https://arxiv.org/abs/1705.09792
     https://github.com/pytorch/pytorch/issues/47052#issuecomment-718948801
@@ -176,7 +181,7 @@ class ModReLU(nn.Module):
     def forward(self, x):
         return F.relu(torch.abs(x) + self.b) * torch.exp(1.j * torch.angle(x))
 
-class ComplexConv2d(nn.Module):
+class ComplexConv2d(Module):
     def __init__(
         self,
         dim,
@@ -212,7 +217,7 @@ def ComplexSTFTResidualUnit(chan_in, chan_out, strides):
         ComplexConv2d(chan_in, chan_out, kernel_sizes, stride = strides, padding = paddings)
     )
 
-class ComplexSTFTDiscriminator(nn.Module):
+class ComplexSTFTDiscriminator(Module):
     def __init__(
         self,
         *,
@@ -224,6 +229,7 @@ class ComplexSTFTDiscriminator(nn.Module):
         hop_length = 256,
         win_length = 1024,
         stft_normalized = False,
+        stft_window_fn = torch.hann_window,
         logits_abs = True
     ):
         super().__init__()
@@ -235,7 +241,7 @@ class ComplexSTFTDiscriminator(nn.Module):
 
         curr_channels = channels
 
-        self.layers = nn.ModuleList([])
+        self.layers = ModuleList([])
 
         for layer_stride, (chan_in, chan_out) in zip(strides, layer_channels_pairs):
             self.layers.append(ComplexSTFTResidualUnit(chan_in, chan_out, layer_stride))
@@ -245,12 +251,14 @@ class ComplexSTFTDiscriminator(nn.Module):
         # stft settings
 
         self.stft_normalized = stft_normalized
+        self.stft_window_fn = stft_window_fn
 
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = win_length
 
         # how to output the logits into real space
+
         self.logits_abs = logits_abs
 
     def forward(self, x, return_intermediates = False):
@@ -264,11 +272,14 @@ class ComplexSTFTDiscriminator(nn.Module):
         H = 256 samples
         '''
 
+        stft_window = self.stft_window_fn(self.win_length, device = x.device)
+
         x = torch.stft(
             x,
             self.n_fft,
             hop_length = self.hop_length,
             win_length = self.win_length,
+            window = stft_window,
             normalized = self.stft_normalized,
             return_complex = True
         )
@@ -299,15 +310,25 @@ class ComplexSTFTDiscriminator(nn.Module):
 
 # sound stream
 
-class Residual(nn.Module):
-    def __init__(self, fn):
+class Residual(Module):
+    def __init__(self, fn: Module):
         super().__init__()
         self.fn = fn
 
     def forward(self, x, **kwargs):
         return self.fn(x, **kwargs) + x
 
-class CausalConv1d(nn.Module):
+class ChannelTranspose(Module):
+    def __init__(self, fn: Module):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x, **kwargs):
+        x = rearrange(x, 'b c n -> b n c')
+        out = self.fn(x, **kwargs) + x
+        return rearrange(out, 'b n c -> b c n')
+
+class CausalConv1d(Module):
     def __init__(self, chan_in, chan_out, kernel_size, pad_mode = 'reflect', **kwargs):
         super().__init__()
         kernel_size = kernel_size
@@ -322,7 +343,7 @@ class CausalConv1d(nn.Module):
         x = F.pad(x, (self.causal_padding, 0), mode = self.pad_mode)
         return self.conv(x)
 
-class CausalConvTranspose1d(nn.Module):
+class CausalConvTranspose1d(Module):
     def __init__(self, chan_in, chan_out, kernel_size, stride, **kwargs):
         super().__init__()
         self.upsample_factor = stride
@@ -372,7 +393,7 @@ def DecoderBlock(chan_in, chan_out, stride, cycle_dilations = (1, 3, 9), squeeze
         residual_unit(chan_out, chan_out, next(it)),
     )
 
-class LocalTransformer(nn.Module):
+class LocalTransformer(Module):
     def __init__(
         self,
         *,
@@ -385,15 +406,24 @@ class LocalTransformer(nn.Module):
     ):
         super().__init__()
         self.window_size = window_size
-        self.layers = nn.ModuleList([])
+        self.layers = ModuleList([])
 
         self.pos_bias = None
         if dynamic_pos_bias:
             self.pos_bias = DynamicPositionBias(dim = dim // 2, heads = heads)
 
         for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                LocalMHA(dim = dim, heads = heads, qk_rmsnorm = True, window_size = window_size, use_rotary_pos_emb = not dynamic_pos_bias, use_xpos = True, **kwargs),
+            self.layers.append(ModuleList([
+                LocalMHA(
+                    dim = dim,
+                    heads = heads,
+                    qk_rmsnorm = True,
+                    window_size = window_size,
+                    use_rotary_pos_emb = not dynamic_pos_bias,
+                    gate_values_per_head = True,
+                    use_xpos = True,
+                    **kwargs
+                ),
                 FeedForward(dim = dim)
             ]))
 
@@ -408,7 +438,7 @@ class LocalTransformer(nn.Module):
 
         return x
 
-class FiLM(nn.Module):
+class FiLM(Module):
     def __init__(self, dim, dim_cond):
         super().__init__()
         self.to_cond = nn.Linear(dim_cond, dim * 2)
@@ -417,7 +447,7 @@ class FiLM(nn.Module):
         gamma, beta = self.to_cond(cond).chunk(2, dim = -1)
         return x * gamma + beta
 
-class SoundStream(nn.Module):
+class SoundStream(Module):
     def __init__(
         self,
         *,
@@ -425,7 +455,8 @@ class SoundStream(nn.Module):
         strides = (2, 4, 5, 8),
         channel_mults = (2, 4, 8, 16),
         codebook_dim = 512,
-        codebook_size = 1024,
+        codebook_size: Optional[int] = None,
+        finite_scalar_quantizer_levels: Optional[List[int]] = None,
         rq_num_quantizers = 8,
         rq_commitment_weight = 1.,
         rq_ema_decay = 0.95,
@@ -433,6 +464,8 @@ class SoundStream(nn.Module):
         rq_groups = 1,
         rq_stochastic_sample_codes = False,
         rq_kwargs: dict = {},
+        use_lookup_free_quantizer = False,              # proposed in https://arxiv.org/abs/2310.05737, adapted for residual quantization
+        use_finite_scalar_quantizer = False,            # proposed in https://arxiv.org/abs/2309.15505, adapted for residual quantization
         input_channels = 1,
         discr_multi_scales = (1, 0.5, 0.25),
         stft_normalized = False,
@@ -454,10 +487,12 @@ class SoundStream(nn.Module):
         attn_depth = 1,
         attn_xpos_scale_base = None,
         attn_dynamic_pos_bias = False,
+        use_gate_loop_layers = False,
         squeeze_excite = False,
         complex_stft_discr_logits_abs = True,
         pad_mode = 'reflect',
-        stft_discriminator: Optional[nn.Module] = None  # can pass in own stft discriminator
+        stft_discriminator: Optional[Module] = None,  # can pass in own stft discriminator
+        complex_stft_discr_kwargs: dict = dict()
     ):
         super().__init__()
 
@@ -484,6 +519,9 @@ class SoundStream(nn.Module):
         for ((chan_in, chan_out), layer_stride) in zip(chan_in_out_pairs, strides):
             encoder_blocks.append(EncoderBlock(chan_in, chan_out, layer_stride, enc_cycle_dilations, squeeze_excite, pad_mode))
 
+            if use_gate_loop_layers:
+                encoder_blocks.append(Residual(ChannelTranspose(GateLoop(chan_out, use_heinsen = False))))
+
         self.encoder = nn.Sequential(
             CausalConv1d(input_channels, channels, 7, pad_mode = pad_mode),
             *encoder_blocks,
@@ -509,25 +547,63 @@ class SoundStream(nn.Module):
         self.num_quantizers = rq_num_quantizers
 
         self.codebook_dim = codebook_dim
-        self.codebook_size = codebook_size
 
         self.rq_groups = rq_groups
 
-        self.rq = GroupedResidualVQ(
-            dim = codebook_dim,
-            num_quantizers = rq_num_quantizers,
-            codebook_size = codebook_size,
-            groups = rq_groups,
-            decay = rq_ema_decay,
-            commitment_weight = rq_commitment_weight,
-            quantize_dropout_multiple_of = rq_quantize_dropout_multiple_of,
-            kmeans_init = True,
-            threshold_ema_dead_code = 2,
-            quantize_dropout = True,
-            quantize_dropout_cutoff_index = quantize_dropout_cutoff_index,
-            stochastic_sample_codes = rq_stochastic_sample_codes,
-            **rq_kwargs
-        )
+        assert not (use_lookup_free_quantizer and use_finite_scalar_quantizer)
+
+        self.use_lookup_free_quantizer = use_lookup_free_quantizer
+        self.use_finite_scalar_quantizer = use_finite_scalar_quantizer
+
+        if use_lookup_free_quantizer:
+            assert exists(codebook_size) and not exists(finite_scalar_quantizer_levels), 'if use_finite_scalar_quantizer is set to False, `codebook_size` must be set (and not `finite_scalar_quantizer_levels`)'
+
+            self.rq = GroupedResidualLFQ(
+                dim = codebook_dim,
+                num_quantizers = rq_num_quantizers,
+                codebook_size = codebook_size,
+                groups = rq_groups,
+                quantize_dropout = True,
+                quantize_dropout_cutoff_index = quantize_dropout_cutoff_index,
+                **rq_kwargs
+            )
+
+            self.codebook_size = codebook_size
+
+        elif use_finite_scalar_quantizer:
+            assert not exists(codebook_size) and exists(finite_scalar_quantizer_levels), 'if use_finite_scalar_quantizer is set to True, `finite_scalar_quantizer_levels` must be set (and not `codebook_size`). the effective codebook size is the cumulative product of all the FSQ levels'
+
+            self.rq = GroupedResidualFSQ(
+                dim = codebook_dim,
+                levels = finite_scalar_quantizer_levels,
+                num_quantizers = rq_num_quantizers,
+                groups = rq_groups,
+                quantize_dropout = True,
+                quantize_dropout_cutoff_index = quantize_dropout_cutoff_index,
+                **rq_kwargs
+            )
+
+            self.codebook_size = self.rq.codebook_size
+
+        else:
+            assert exists(codebook_size) and not exists(finite_scalar_quantizer_levels), 'if use_finite_scalar_quantizer is set to False, `codebook_size` must be set (and not `finite_scalar_quantizer_levels`)'
+            self.rq = GroupedResidualVQ(
+                dim = codebook_dim,
+                num_quantizers = rq_num_quantizers,
+                codebook_size = codebook_size,
+                groups = rq_groups,
+                decay = rq_ema_decay,
+                commitment_weight = rq_commitment_weight,
+                quantize_dropout_multiple_of = rq_quantize_dropout_multiple_of,
+                kmeans_init = True,
+                threshold_ema_dead_code = 2,
+                quantize_dropout = True,
+                quantize_dropout_cutoff_index = quantize_dropout_cutoff_index,
+                stochastic_sample_codes = rq_stochastic_sample_codes,
+                **rq_kwargs
+            )
+
+            self.codebook_size = codebook_size
 
         self.decoder_film = FiLM(codebook_dim, dim_cond = 2)
 
@@ -538,6 +614,9 @@ class SoundStream(nn.Module):
         for ((chan_in, chan_out), layer_stride) in zip(reversed(chan_in_out_pairs), reversed(strides)):
             decoder_blocks.append(DecoderBlock(chan_out, chan_in, layer_stride, dec_cycle_dilations, squeeze_excite, pad_mode))
 
+            if use_gate_loop_layers:
+                decoder_blocks.append(Residual(ChannelTranspose(GateLoop(chan_in))))
+
         self.decoder = nn.Sequential(
             CausalConv1d(codebook_dim, layer_channels[-1], 7, pad_mode = pad_mode),
             *decoder_blocks,
@@ -547,21 +626,22 @@ class SoundStream(nn.Module):
         # discriminators
 
         self.discr_multi_scales = discr_multi_scales
-        self.discriminators = nn.ModuleList([MultiScaleDiscriminator() for _ in range(len(discr_multi_scales))])
+        self.discriminators = ModuleList([MultiScaleDiscriminator() for _ in range(len(discr_multi_scales))])
         discr_rel_factors = [int(s1 / s2) for s1, s2 in zip(discr_multi_scales[:-1], discr_multi_scales[1:])]
-        self.downsamples = nn.ModuleList([nn.Identity()] + [nn.AvgPool1d(2 * factor, stride = factor, padding = factor) for factor in discr_rel_factors])
+        self.downsamples = ModuleList([nn.Identity()] + [nn.AvgPool1d(2 * factor, stride = factor, padding = factor) for factor in discr_rel_factors])
 
         self.stft_discriminator = stft_discriminator
 
         if not exists(self.stft_discriminator):
             self.stft_discriminator = ComplexSTFTDiscriminator(
                 stft_normalized = stft_normalized,
-                logits_abs = complex_stft_discr_logits_abs  # whether to output as abs() or use view_as_real
+                logits_abs = complex_stft_discr_logits_abs,  # whether to output as abs() or use view_as_real
+                **complex_stft_discr_kwargs
             )
 
         # multi spectral reconstruction
 
-        self.mel_spec_transforms = nn.ModuleList([])
+        self.mel_spec_transforms = ModuleList([])
         self.mel_spec_recon_alphas = []
 
         num_transforms = len(multi_spectral_window_powers_of_two)
@@ -595,7 +675,7 @@ class SoundStream(nn.Module):
         self.adversarial_loss_weight = adversarial_loss_weight
         self.feature_loss_weight = feature_loss_weight
 
-        self.register_buffer('zero', torch.tensor([0.]), persistent = False)
+        self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
     @property
     def device(self):
@@ -606,10 +686,12 @@ class SoundStream(nn.Module):
         return pickle.loads(self._configs)
 
     def decode_from_codebook_indices(self, quantized_indices):
-        quantized_indices = rearrange(quantized_indices, 'b n (g q) -> g b n q', g = self.rq_groups)
+        assert quantized_indices.dtype in (torch.long, torch.int32)
 
-        codes = self.rq.get_codes_from_indices(quantized_indices)
-        x = reduce(codes, 'g q b n d -> b n (g d)', 'sum')
+        if quantized_indices.ndim == 3:
+            quantized_indices = rearrange(quantized_indices, 'b n (g q) -> g b n q', g = self.rq_groups)
+
+        x = self.rq.get_output_from_indices(quantized_indices)
 
         return self.decode(x)
 
@@ -617,7 +699,9 @@ class SoundStream(nn.Module):
         if quantize:
             x, *_ = self.rq(x)
 
-        x = self.decoder_attn(x)
+        if exists(self.decoder_attn):
+            x = self.decoder_attn(x)
+
         x = rearrange(x, 'b n c -> b c n')
         return self.decoder(x)
 
@@ -642,6 +726,7 @@ class SoundStream(nn.Module):
         config = pickle.loads(pkg['config'])
         soundstream = cls(**config)
         soundstream.load(path, strict = strict)
+        soundstream.eval()
         return soundstream
 
     def load(self, path, strict = True):
@@ -676,7 +761,8 @@ class SoundStream(nn.Module):
             *(self.encoder_attn.parameters() if exists(self.encoder_attn) else []),
             *(self.decoder_attn.parameters() if exists(self.decoder_attn) else []),
             *self.encoder_film.parameters(),
-            *self.decoder_film.parameters()
+            *self.decoder_film.parameters(),
+            *self.rq.parameters()
         ]
 
     @property
@@ -705,12 +791,18 @@ class SoundStream(nn.Module):
 
         return x, ps
 
+    @torch.no_grad()
+    def tokenize(self, audio):
+        self.eval()
+        return self.forward(audio, return_codes_only = True)
+
     def forward(
         self,
         x,
         target = None,
         is_denoising = None, # if you want to learn film conditioners that teach the soundstream to denoise - target would need to be passed in above
         return_encoded = False,
+        return_codes_only = False,
         return_discr_loss = False,
         return_discr_losses_separately = False,
         return_loss_breakdown = False,
@@ -741,7 +833,16 @@ class SoundStream(nn.Module):
             denoise_input = torch.tensor([is_denoising, not is_denoising], dtype = x.dtype, device = self.device) # [1, 0] for denoise, [0, 1] for not denoising
             x = self.encoder_film(x, denoise_input)
 
-        x, indices, commit_loss = self.rq(x)
+        if not self.use_finite_scalar_quantizer:
+            x, indices, commit_loss = self.rq(x)
+        else:
+            # finite scalar quantizer does not have any aux loss
+
+            x, indices = self.rq(x)
+            commit_loss = self.zero
+
+        if return_codes_only:
+            return indices
 
         if return_encoded:
             indices = rearrange(indices, 'g b n q -> b n (g q)')

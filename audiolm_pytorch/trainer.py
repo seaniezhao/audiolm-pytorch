@@ -1,11 +1,15 @@
 import re
-from math import sqrt
 import copy
+from math import sqrt
+from datetime import timedelta
 from random import choice
 from pathlib import Path
 from shutil import rmtree
+from functools import partial
+from collections import Counter
+from contextlib import contextmanager, nullcontext
 
-from beartype.typing import Union, List, Optional, Tuple
+from beartype.typing import Union, List, Optional, Tuple, Type
 from typing_extensions import Annotated
 
 from beartype import beartype
@@ -15,12 +19,16 @@ from beartype.vale import Is
 import torch
 import torchaudio
 from torch import nn
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
 from torch.utils.data import Dataset, DataLoader, random_split
+
+import pytorch_warmup as warmup
 
 from einops import rearrange
 
 from audiolm_pytorch.optimizer import get_optimizer
-
+import wandb
 from ema_pytorch import EMA
 
 from audiolm_pytorch.soundstream import SoundStream
@@ -43,12 +51,15 @@ from audiolm_pytorch.utils import AudioConditionerBase
 from audiolm_pytorch.version import __version__
 from packaging import version
 
-from accelerate import (Accelerator, DistributedType)
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate import Accelerator, DistributedType
+from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
+from accelerate.tracking import WandBTracker
 
 # constants
 
 DEFAULT_SAMPLE_RATE = 16000
+
+ConstantLRScheduler = partial(LambdaLR, lr_lambda = lambda step: 1.)
 
 # make sure only one trainer is instantiated
 
@@ -58,6 +69,8 @@ def check_one_trainer():
     global ONE_TRAINER_INSTANTIATED
     assert not ONE_TRAINER_INSTANTIATED, 'only one Trainer can be instantiated at a time for training'
     ONE_TRAINER_INSTANTIATED = True
+
+DEFAULT_DDP_KWARGS = DistributedDataParallelKwargs(find_unused_parameters = True)
 
 # for automatically routing data emitted from a dataset to keywords of the transformer wrappers
 
@@ -78,8 +91,17 @@ DATASET_FIELD_TYPE_CONFIG = dict(
 def exists(val):
     return val is not None
 
+def default(val, d):
+    return val if exists(val) else d
+
 def noop(*args, **kwargs):
     pass
+
+def find_first(cond, arr):
+    for el in arr:
+        if cond(el):
+            return el
+    return None
 
 def cycle(dl):
     while True:
@@ -99,14 +121,16 @@ def accum_log(log, new_logs):
         log[key] = old_value + new_value
     return log
 
+def dict_values_to_device(d: dict, device):
+    out = {}
+    for k, v in d.items():
+        out[k] = v.to(device) if torch.is_tensor(v) else v
+    return out
+
 # auto data to module keyword argument routing functions
 
 def has_duplicates(tup):
-    counts = dict()
-    for el in tup:
-        if el not in counts:
-            counts[el] = 0
-        counts[el] += 1
+    counts = dict(Counter(tup))
     return any(filter(lambda count: count > 1, counts.values()))
 
 def determine_types(data, config):
@@ -134,6 +158,53 @@ def checkpoint_num_steps(checkpoint_path):
 
     return int(results[-1])
 
+# optimizer with scheduler + warmup
+
+class OptimizerWithWarmupSchedule(nn.Module):
+    @beartype
+    def __init__(
+        self,
+        accelerator: Accelerator,
+        optimizer: Optimizer,
+        scheduler: Optional[Type[_LRScheduler]] = None,
+        scheduler_kwargs: dict = dict(),
+        warmup_steps: int = 0
+    ):
+        super().__init__()
+        self.warmup = warmup.LinearWarmup(optimizer, warmup_period = warmup_steps)
+
+        if exists(scheduler):
+            self.scheduler = scheduler(optimizer, **scheduler_kwargs)
+        else:
+            self.scheduler = ConstantLRScheduler(optimizer)
+
+        self.optimizer = optimizer
+
+        self.optimizer, self.scheduler = accelerator.prepare(self.optimizer, self.scheduler)
+        self.accelerator = accelerator
+
+    def state_dict(self):
+        return dict(
+            optimizer = self.optimizer.state_dict(),
+            scheduler = self.scheduler.state_dict(),
+            warmup = self.warmup.state_dict()
+        )
+
+    def load_state_dict(self, pkg):
+        self.optimizer.load_state_dict(pkg['optimizer'])
+        self.scheduler.load_state_dict(pkg['scheduler'])
+        self.warmup.load_state_dict(pkg['warmup'])
+
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+
+    def step(self):
+        self.optimizer.step()
+
+        if not self.accelerator.optimizer_step_was_skipped:
+            with self.warmup.dampening():
+                self.scheduler.step()
+
 # main trainer class
 
 class SoundStreamTrainer(nn.Module):
@@ -147,16 +218,24 @@ class SoundStreamTrainer(nn.Module):
         data_max_length: int = None,
         data_max_length_seconds: Union[int, float] = None,
         folder: str = None,
-        train_dataloader: DataLoader = None,
-        val_dataloader: DataLoader = None,
+        dataset: Optional[Dataset] = None,
+        val_dataset: Optional[Dataset] = None,
+        train_dataloader: Optional[DataLoader] = None,
+        val_dataloader: Optional[DataLoader] = None,
         lr: float = 2e-4,
         grad_accum_every: int = 4,
         wd: float = 0.,
+        warmup_steps: int = 1000,
+        scheduler: Optional[Type[_LRScheduler]] = None,
+        scheduler_kwargs: dict = dict(),
+        discr_warmup_steps: Optional[int] = None,
+        discr_scheduler: Optional[Type[_LRScheduler]] = None,
+        discr_scheduler_kwargs: dict = dict(),
         max_grad_norm: float = 0.5,
         discr_max_grad_norm: float = None,
         save_results_every: int = 100,
-        save_model_every: int= 1000,
-        log_losses_every: int= 1,
+        save_model_every: int = 1000,
+        log_losses_every: int = 1,
         results_folder: str = './results',
         valid_frac: float = 0.05,
         random_split_seed: int = 42,
@@ -166,11 +245,12 @@ class SoundStreamTrainer(nn.Module):
         ema_update_every: int = 10,
         apply_grad_penalty_every: int = 4,
         dl_num_workers: int = 0,
-        accelerator: Accelerator = None,
+        accelerator: Optional[Accelerator] = None,
         accelerate_kwargs: dict = dict(),
+        init_process_group_timeout_seconds = 1800,
         dataloader_drop_last = True,
         split_batches = False,
-        use_lion: bool = False,
+        use_wandb_tracking = False,
         force_clear_prev_results: bool = None  # set to True | False to skip the prompt
     ):
         """
@@ -180,14 +260,19 @@ class SoundStreamTrainer(nn.Module):
         super().__init__()
         check_one_trainer()
 
-        if accelerator:
-            self.accelerator = accelerator
-            assert len(accelerate_kwargs) == 0
-        else:
-            kwargs = DistributedDataParallelKwargs(find_unused_parameters = True)
+        self.accelerator = accelerator
+        assert not (exists(accelerator) and len(accelerate_kwargs) > 0)
+
+        self.use_wandb_tracking = use_wandb_tracking
+
+        if not exists(self.accelerator):
+            init_process_kwargs = InitProcessGroupKwargs(timeout = timedelta(seconds = init_process_group_timeout_seconds))
+
+            if use_wandb_tracking:
+                accelerate_kwargs.update(log_with = 'wandb')
 
             self.accelerator = Accelerator(
-                kwargs_handlers = [kwargs],
+                kwargs_handlers = [DEFAULT_DDP_KWARGS, init_process_kwargs],
                 split_batches = split_batches,
                 **accelerate_kwargs
             )
@@ -198,7 +283,7 @@ class SoundStreamTrainer(nn.Module):
         if self.use_ema:
             self.ema_soundstream = EMA(soundstream, beta = ema_beta, update_after_step = ema_update_after_step, update_every = ema_update_every)
 
-        self.register_buffer('steps', torch.Tensor([0]))
+        self.register_buffer('steps', torch.tensor(0))
 
         self.num_train_steps = num_train_steps
         self.batch_size = batch_size
@@ -214,27 +299,44 @@ class SoundStreamTrainer(nn.Module):
 
         # optimizers
 
-        self.optim = get_optimizer(soundstream.non_discr_parameters(), lr = lr, wd = wd)
+        self.optim = OptimizerWithWarmupSchedule(
+            self.accelerator,
+            get_optimizer(soundstream.non_discr_parameters(), lr = lr, wd = wd),
+            scheduler = scheduler,
+            scheduler_kwargs = scheduler_kwargs,
+            warmup_steps = warmup_steps
+        )
+
+        discr_warmup_steps = default(discr_warmup_steps, warmup_steps)
 
         for discr_optimizer_key, discr in self.multiscale_discriminator_iter():
-            one_multiscale_discr_optimizer = get_optimizer(discr.parameters(), lr = lr, wd = wd)
+            one_multiscale_discr_optimizer = OptimizerWithWarmupSchedule(
+                self.accelerator,
+                get_optimizer(discr.parameters(), lr = lr, wd = wd),
+                scheduler = discr_scheduler,
+                scheduler_kwargs = discr_scheduler_kwargs,
+                warmup_steps = discr_warmup_steps
+            )
             setattr(self, discr_optimizer_key, one_multiscale_discr_optimizer)
 
-        self.discr_optim = get_optimizer(soundstream.stft_discriminator.parameters(), lr = lr, wd = wd, use_lion = use_lion)
+        self.discr_optim = OptimizerWithWarmupSchedule(
+            self.accelerator,
+            get_optimizer(soundstream.stft_discriminator.parameters(), lr = lr, wd = wd),
+            scheduler = discr_scheduler,
+            scheduler_kwargs = discr_scheduler_kwargs,
+            warmup_steps = discr_warmup_steps
+        )
 
         # max grad norm
 
         self.max_grad_norm = max_grad_norm
         self.discr_max_grad_norm = discr_max_grad_norm
 
-        if folder is None:
-            assert train_dataloader is not None
-            assert val_dataloader is not None
-            self.dl = train_dataloader
-            self.valid_dl = val_dataloader
-        else:
-            assert train_dataloader is None
-            assert val_dataloader is None
+        if exists(folder):
+            assert not exists(dataset)
+            assert not exists(val_dataset)
+            assert not exists(train_dataloader)
+            assert not exists(val_dataloader)
 
             # create dataset
 
@@ -246,32 +348,41 @@ class SoundStreamTrainer(nn.Module):
 
             hyperparameters['data_max_length'] = data_max_length
 
-            self.ds = SoundDataset(
+            dataset = SoundDataset(
                 folder,
                 max_length = data_max_length,
                 target_sample_hz = soundstream.target_sample_hz,
                 seq_len_multiple_of = soundstream.seq_len_multiple_of
             )
 
-            # split for validation
+            assert len(dataset) >= batch_size, 'dataset must have sufficient samples for training'
+
+        if exists(dataset):
+            assert not exists(train_dataloader)
+            assert not exists(val_dataloader)
+
+            # maybe split for validation
 
             if valid_frac > 0:
-                train_size = int((1 - valid_frac) * len(self.ds))
-                valid_size = len(self.ds) - train_size
-                self.ds, self.valid_ds = random_split(self.ds, [train_size, valid_size], generator = torch.Generator().manual_seed(random_split_seed))
-                self.print(f'training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples')
+                train_size = int((1 - valid_frac) * len(dataset))
+                valid_size = len(dataset) - train_size
+                dataset, val_dataset = random_split(dataset, [train_size, valid_size], generator = torch.Generator().manual_seed(random_split_seed))
+                self.print(f'training with dataset of {len(dataset)} samples and validating with randomly splitted {len(val_dataset)} samples')
             else:
-                self.valid_ds = self.ds
-                self.print(f'training with shared training and valid dataset of {len(self.ds)} samples')
+                val_dataset = dataset
+                self.print(f'training with shared training and valid dataset of {len(dataset)} samples')
 
-            assert len(self.ds) >= batch_size, 'dataset must have sufficient samples for training'
-            assert len(self.valid_ds) >= batch_size, f'validation dataset must have sufficient number of samples (currently {len(self.valid_ds)}) for training'
+            assert len(val_dataset) >= batch_size, f'validation dataset must have sufficient number of samples (currently {len(val_dataset)}) for training'
 
-            # dataloader
+            train_dataloader = get_dataloader(dataset, batch_size = batch_size, num_workers = dl_num_workers, shuffle = True, drop_last = dataloader_drop_last)
+            val_dataloader = get_dataloader(val_dataset, batch_size = batch_size, num_workers = dl_num_workers, shuffle = True, drop_last = dataloader_drop_last)
 
-            self.dl = get_dataloader(self.ds, batch_size = batch_size, num_workers = dl_num_workers, shuffle = True, drop_last = dataloader_drop_last)
+        # dataloader
 
-            self.valid_dl = get_dataloader(self.valid_ds, batch_size = batch_size, num_workers = dl_num_workers, shuffle = True, drop_last = dataloader_drop_last)
+        self.dl = train_dataloader
+        self.valid_dl = val_dataloader
+
+        assert exists(self.dl) and exists(self.valid_dl)
 
         # prepare with accelerator
 
@@ -310,14 +421,21 @@ class SoundStreamTrainer(nn.Module):
         if self.is_main and force_clear_prev_results is True or (not exists(force_clear_prev_results) and len([*self.results_folder.glob('**/*')]) > 0 and yes_or_no('do you want to clear previous experiment checkpoints and results?')):
             rmtree(str(self.results_folder))
 
+        self.accelerator.wait_for_everyone()
         self.results_folder.mkdir(parents = True, exist_ok = True)
 
-        # Initialize experiment trackers if an external Accelerator is not passed in
+        # save tracker hyperparameters
 
-        if not accelerator:
-            self.accelerator.init_trackers("soundstream", config=hyperparameters)        
+        self.tracker_hps = hyperparameters
 
         assert self.accelerator.distributed_type != DistributedType.FSDP, 'FSDP not supported for soundstream trainer due to complex-valued stft discriminator'
+
+    @property
+    def ema_tokenizer(self):
+        return self.ema_soundstream.ema_model
+
+    def tokenize(self, audio):
+        return ema_tokenizer.tokenize(audio)
 
     def set_model_as_ema_model_(self):
         """ this will force the main 'online' model to have same parameters as the exponentially moving averaged model """
@@ -395,6 +513,27 @@ class SoundStreamTrainer(nn.Module):
     def print(self, msg):
         self.accelerator.print(msg)
 
+    def log(self, **logs_as_kwargs):
+        self.accelerator.log(logs_as_kwargs, step = self.steps.item())
+
+    @contextmanager
+    def wandb_tracker(self, project, run = None, hps = None):
+        assert self.use_wandb_tracking, '`use_wandb_tracking` must be set to True on SoundStreamTrainer'
+
+        hps = default(hps, self.tracker_hps)
+
+        self.accelerator.init_trackers(project, config = None)
+
+        if exists(run):
+            wandb_tracker = find_first(lambda el: isinstance(el, WandBTracker), self.accelerator.trackers)
+            assert exists(wandb_tracker)
+
+            wandb_tracker.run.name = run
+
+        yield
+
+        self.accelerator.end_training()
+
     @property
     def device(self):
         return self.accelerator.device
@@ -426,13 +565,17 @@ class SoundStreamTrainer(nn.Module):
 
         # update vae (generator)
 
-        for _ in range(self.grad_accum_every):
+        for i in range(self.grad_accum_every):
+            is_last = i == (self.grad_accum_every - 1)
+            context = partial(self.accelerator.no_sync, self.soundstream) if not is_last else nullcontext
+
             wave, = next(self.dl_iter)
             wave = wave.to(device)
 
-            loss, (recon_loss, multi_spectral_recon_loss, adversarial_loss, feature_loss, all_commitment_loss) = self.soundstream(wave, return_loss_breakdown = True)
+            with self.accelerator.autocast(), context():
+                loss, (recon_loss, multi_spectral_recon_loss, adversarial_loss, feature_loss, all_commitment_loss) = self.soundstream(wave, return_loss_breakdown = True)
 
-            self.accelerator.backward(loss / self.grad_accum_every)
+                self.accelerator.backward(loss / self.grad_accum_every)
 
             accum_log(logs, dict(
                 loss = loss.item() / self.grad_accum_every,
@@ -460,22 +603,27 @@ class SoundStreamTrainer(nn.Module):
         for name, multiscale_discr_optim in self.multiscale_discriminator_optim_iter():
             multiscale_discr_optim.zero_grad()
 
-        for _ in range(self.grad_accum_every):
+        for i in range(self.grad_accum_every):
+            is_last = i == (self.grad_accum_every - 1)
+            context = partial(self.accelerator.no_sync, self.soundstream) if not is_last else nullcontext
+
             wave, = next(self.dl_iter)
             wave = wave.to(device)
 
-            discr_losses = self.soundstream(
-                wave,
-                apply_grad_penalty = apply_grad_penalty,
-                return_discr_loss = True,
-                return_discr_losses_separately = True
-            )
+            with self.accelerator.autocast(), context():
+                discr_losses = self.soundstream(
+                    wave,
+                    apply_grad_penalty = apply_grad_penalty,
+                    return_discr_loss = True,
+                    return_discr_losses_separately = True
+                )
 
-            for name, discr_loss in discr_losses:
-                self.accelerator.backward(discr_loss / self.grad_accum_every, retain_graph = True)
-                accum_log(logs, {name: discr_loss.item() / self.grad_accum_every})
+                for name, discr_loss in discr_losses:
+                    self.accelerator.backward(discr_loss / self.grad_accum_every, retain_graph = True)
+                    accum_log(logs, {name: discr_loss.item() / self.grad_accum_every})
 
         if exists(self.discr_max_grad_norm):
+            self.accelerator.clip_grad_norm_(self.soundstream.discriminators.parameters(), self.discr_max_grad_norm)
             self.accelerator.clip_grad_norm_(self.soundstream.stft_discriminator.parameters(), self.discr_max_grad_norm)
 
         # gradient step for all discriminators
@@ -488,16 +636,9 @@ class SoundStreamTrainer(nn.Module):
         # build pretty printed losses
 
         losses_str = f"{steps}: soundstream total loss: {logs['loss']:.3f}, soundstream recon loss: {logs['recon_loss']:.3f}"
+
         if log_losses:
-            self.accelerator.log({
-                "total_loss": logs['loss'],
-                "recon_loss": logs['recon_loss'],
-                "multi_spectral_recon_loss": logs['multi_spectral_recon_loss'],
-                "adversarial_loss": logs['adversarial_loss'],
-                "feature_loss": logs['feature_loss'],
-                "all_commitment_loss": logs['all_commitment_loss'],
-                "stft_discr_loss": logs['stft']
-            }, step=steps)
+            self.log(**logs)
 
         for key, loss in logs.items():
             if not key.startswith('scale:'):
@@ -505,8 +646,9 @@ class SoundStreamTrainer(nn.Module):
             _, scale_factor = key.split(':')
 
             losses_str += f" | discr (scale {scale_factor}) loss: {loss:.3f}"
+
             if log_losses:
-                self.accelerator.log({f"discr_loss (scale {scale_factor})": loss}, step=steps)
+                self.log(**{f"discr_loss (scale {scale_factor})": loss})
 
         # log
 
@@ -533,6 +675,7 @@ class SoundStreamTrainer(nn.Module):
 
             for model, label in models:
                 model.eval()
+                model = model.to(device)
 
                 with torch.inference_mode():
                     recons = model(wave, return_recons_only = True)
@@ -553,7 +696,9 @@ class SoundStreamTrainer(nn.Module):
 
             self.print(f'{steps}: saving model to {str(self.results_folder)}')
 
-        self.steps += 1
+        self.accelerator.wait_for_everyone()
+
+        self.steps.add_(1)
         return logs
 
     def train(self, log_fn = noop):
@@ -577,6 +722,7 @@ class SemanticTransformerTrainer(nn.Module):
         batch_size,
         audio_conditioner: Optional[AudioConditionerBase] = None,
         dataset: Optional[Dataset] = None,
+        valid_dataset: Optional[Dataset] = None,
         data_max_length = None,
         data_max_length_seconds = None,
         folder = None,
@@ -590,6 +736,8 @@ class SemanticTransformerTrainer(nn.Module):
         save_model_every = 1000,
         results_folder = './results',
         accelerate_kwargs: dict = dict(),
+        init_process_group_timeout_seconds = 1800,
+        use_wandb_tracking = False,
         split_batches = False,
         drop_last = False,
         force_clear_prev_results = None,
@@ -598,11 +746,15 @@ class SemanticTransformerTrainer(nn.Module):
         super().__init__()
         check_one_trainer()
 
+        init_process_kwargs = InitProcessGroupKwargs(timeout = timedelta(seconds = init_process_group_timeout_seconds))
+        self.use_wandb_tracking = use_wandb_tracking
+        if use_wandb_tracking:
+            accelerate_kwargs.update(log_with = 'wandb')
         self.accelerator = Accelerator(
+            kwargs_handlers = [DEFAULT_DDP_KWARGS, init_process_kwargs],
             split_batches = split_batches,
             **accelerate_kwargs
         )
-
         self.wav2vec = wav2vec
         self.transformer = transformer
         self.audio_conditioner = audio_conditioner
@@ -613,7 +765,7 @@ class SemanticTransformerTrainer(nn.Module):
             audio_conditioner = audio_conditioner
         )
 
-        self.register_buffer('steps', torch.Tensor([0]))
+        self.register_buffer('steps', torch.tensor(0))
 
         self.num_train_steps = num_train_steps
         self.batch_size = batch_size
@@ -649,14 +801,17 @@ class SemanticTransformerTrainer(nn.Module):
 
         # split for validation
 
-        if valid_frac > 0:
-            train_size = int((1 - valid_frac) * len(self.ds))
-            valid_size = len(self.ds) - train_size
-            self.ds, self.valid_ds = random_split(self.ds, [train_size, valid_size], generator = torch.Generator().manual_seed(random_split_seed))
-            self.print(f'training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples')
-        else:
-            self.valid_ds = self.ds
-            self.print(f'training with shared training and valid dataset of {len(self.ds)} samples')
+        self.valid_ds = valid_dataset
+
+        if not exists(self.valid_ds):
+            if valid_frac > 0:
+                train_size = int((1 - valid_frac) * len(self.ds))
+                valid_size = len(self.ds) - train_size
+                self.ds, self.valid_ds = random_split(self.ds, [train_size, valid_size], generator = torch.Generator().manual_seed(random_split_seed))
+                self.print(f'training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples')
+            else:
+                self.valid_ds = self.ds
+                self.print(f'training with shared training and valid dataset of {len(self.ds)} samples')
 
         assert len(self.ds) >= batch_size, 'dataset must have sufficient samples for training'
         assert len(self.valid_ds) >= batch_size, f'validation dataset must have sufficient number of samples (currently {len(self.valid_ds)}) for training'
@@ -672,13 +827,11 @@ class SemanticTransformerTrainer(nn.Module):
         (
             self.train_wrapper,
             self.optim,
-            self.dl,
-            self.valid_dl
+            self.dl
         ) = self.accelerator.prepare(
             self.train_wrapper,
             self.optim,
-            self.dl,
-            self.valid_dl
+            self.dl
         )
 
         # dataloader iterators
@@ -687,16 +840,19 @@ class SemanticTransformerTrainer(nn.Module):
         self.valid_dl_iter = cycle(self.valid_dl)
 
         self.save_model_every = save_model_every
-        self.save_results_every = save_results_every    
+        self.save_results_every = save_results_every
 
         self.results_folder = Path(results_folder)
 
         if self.is_main and force_clear_prev_results is True or (not exists(force_clear_prev_results) and len([*self.results_folder.glob('**/*')]) > 0 and yes_or_no('do you want to clear previous experiment checkpoints and results?')):
             rmtree(str(self.results_folder))
 
+        self.accelerator.wait_for_everyone()
         self.results_folder.mkdir(parents = True, exist_ok = True)
-        
+
         hps = {"num_train_steps": num_train_steps, "data_max_length": data_max_length, "learning_rate": lr}
+        self.tracker_hps = hps
+
         self.accelerator.init_trackers("semantic", config=hps)
         self.average_valid_loss_over_grad_accum_every = average_valid_loss_over_grad_accum_every
 
@@ -747,6 +903,24 @@ class SemanticTransformerTrainer(nn.Module):
 
         return dict(zip(self.ds_fields, data))
 
+    @contextmanager
+    def wandb_tracker(self, project, run = None, hps = None):
+        assert self.use_wandb_tracking, '`use_wandb_tracking` must be set to True on SemanticTransformerTrainer'
+
+        hps = default(hps, self.tracker_hps)
+
+        self.accelerator.init_trackers(project, config = None)
+
+        if exists(run):
+            wandb_tracker = find_first(lambda el: isinstance(el, WandBTracker), self.accelerator.trackers)
+            assert exists(wandb_tracker)
+
+            wandb_tracker.run.name = run
+
+        yield
+
+        self.accelerator.end_training()
+
     def train_step(self):
         device = self.device
 
@@ -758,14 +932,18 @@ class SemanticTransformerTrainer(nn.Module):
 
         logs = {}
 
-        # update vae (generator)
+        # update transformer
 
-        for _ in range(self.grad_accum_every):
+        for i in range(self.grad_accum_every):
+            is_last = i == (self.grad_accum_every - 1)
+            context = partial(self.accelerator.no_sync, self.train_wrapper) if not is_last else nullcontext
+
             data_kwargs = self.data_tuple_to_kwargs(next(self.dl_iter))
 
-            loss = self.train_wrapper(**data_kwargs, return_loss = True)
+            with self.accelerator.autocast(), context():
+                loss = self.train_wrapper(**data_kwargs, return_loss = True)
 
-            self.accelerator.backward(loss / self.grad_accum_every)
+                self.accelerator.backward(loss / self.grad_accum_every)
 
             accum_log(logs, {'loss': loss.item() / self.grad_accum_every})
 
@@ -786,14 +964,19 @@ class SemanticTransformerTrainer(nn.Module):
 
         if self.is_main and not (steps % self.save_results_every):
             valid_loss = 0
+            unwrapped_model = self.accelerator.unwrap_model(self.train_wrapper)
+
             for _ in range(self.average_valid_loss_over_grad_accum_every):
                 data_kwargs = self.data_tuple_to_kwargs(next(self.valid_dl_iter))
+                data_kwargs = dict_values_to_device(data_kwargs, unwrapped_model.device)
 
                 with torch.inference_mode():
-                    self.train_wrapper.eval()
-                    valid_loss += self.train_wrapper(**data_kwargs, return_loss = True)
+                    unwrapped_model.eval()
+                    valid_loss += unwrapped_model(**data_kwargs, return_loss = True)
+
             valid_loss = valid_loss.clone() # avoid inference mode to non-inference mode error
             valid_loss /= self.average_valid_loss_over_grad_accum_every
+
             self.print(f'{steps}: valid loss {valid_loss}')
             self.accelerator.log({"valid_loss": valid_loss}, step=steps)
 
@@ -802,10 +985,13 @@ class SemanticTransformerTrainer(nn.Module):
         if self.is_main and not (steps % self.save_model_every):
             model_path = str(self.results_folder / f'semantic.transformer.{steps}.pt')
             self.save(model_path)
-
+            if self.use_wandb_tracking:
+                wandb.save(model_path)
             self.print(f'{steps}: saving model to {str(self.results_folder)}')
 
-        self.steps += 1
+        self.accelerator.wait_for_everyone()
+
+        self.steps.add_(1)
         return logs
 
     def train(self, log_fn = noop):
@@ -830,6 +1016,7 @@ class CoarseTransformerTrainer(nn.Module):
         batch_size,
         audio_conditioner: Optional[AudioConditionerBase] = None,
         dataset: Optional[Dataset] = None,
+        valid_dataset: Optional[Dataset] = None,
         ds_fields: Tuple[str, ...] = ('raw_wave', 'raw_wave_for_codec', 'text'),
         data_max_length = None,
         data_max_length_seconds = None,
@@ -844,15 +1031,22 @@ class CoarseTransformerTrainer(nn.Module):
         save_model_every = 1000,
         results_folder = './results',
         accelerate_kwargs: dict = dict(),
+        init_process_group_timeout_seconds = 1800,
         split_batches = False,
         drop_last = False,
         force_clear_prev_results = None,
+        use_wandb_tracking = False,
         average_valid_loss_over_grad_accum_every: bool = True,  # if False, valid loss on a single batch
     ):
         super().__init__()
         check_one_trainer()
+        self.use_wandb_tracking = use_wandb_tracking
+        if use_wandb_tracking:
+            accelerate_kwargs.update(log_with = 'wandb')
+        init_process_kwargs = InitProcessGroupKwargs(timeout = timedelta(seconds = init_process_group_timeout_seconds))
 
         self.accelerator = Accelerator(
+            kwargs_handlers = [DEFAULT_DDP_KWARGS, init_process_kwargs],
             split_batches = split_batches,
             **accelerate_kwargs
         )
@@ -869,7 +1063,7 @@ class CoarseTransformerTrainer(nn.Module):
             audio_conditioner = audio_conditioner
         )
 
-        self.register_buffer('steps', torch.Tensor([0]))
+        self.register_buffer('steps', torch.tensor(0))
 
         self.num_train_steps = num_train_steps
         self.batch_size = batch_size
@@ -893,7 +1087,7 @@ class CoarseTransformerTrainer(nn.Module):
             assert not (exists(data_max_length) and exists(data_max_length_seconds))
 
             if exists(data_max_length_seconds):
-                data_max_length = tuple(data_max_length_seconds * hz for hz in (wav2vec.target_sample_hz, codec.target_sample_hz))
+                data_max_length = max(data_max_length_seconds * hz for hz in (wav2vec.target_sample_hz, codec.target_sample_hz))
 
             self.ds = SoundDataset(
                 folder,
@@ -909,14 +1103,17 @@ class CoarseTransformerTrainer(nn.Module):
 
         # split for validation
 
-        if valid_frac > 0:
-            train_size = int((1 - valid_frac) * len(self.ds))
-            valid_size = len(self.ds) - train_size
-            self.ds, self.valid_ds = random_split(self.ds, [train_size, valid_size], generator = torch.Generator().manual_seed(random_split_seed))
-            self.print(f'training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples')
-        else:
-            self.valid_ds = self.ds
-            self.print(f'training with shared training and valid dataset of {len(self.ds)} samples')
+        self.valid_ds = valid_dataset
+
+        if not exists(self.valid_ds):
+            if valid_frac > 0:
+                train_size = int((1 - valid_frac) * len(self.ds))
+                valid_size = len(self.ds) - train_size
+                self.ds, self.valid_ds = random_split(self.ds, [train_size, valid_size], generator = torch.Generator().manual_seed(random_split_seed))
+                self.print(f'training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples')
+            else:
+                self.valid_ds = self.ds
+                self.print(f'training with shared training and valid dataset of {len(self.ds)} samples')
 
         assert len(self.ds) >= batch_size, 'dataset must have sufficient samples for training'
         assert len(self.valid_ds) >= batch_size, f'validation dataset must have sufficient number of samples (currently {len(self.valid_ds)}) for training'
@@ -930,15 +1127,13 @@ class CoarseTransformerTrainer(nn.Module):
         # prepare with accelerator
 
         (
-            self.transformer,
+            self.train_wrapper,
             self.optim,
-            self.dl,
-            self.valid_dl
+            self.dl
         ) = self.accelerator.prepare(
-            self.transformer,
+            self.train_wrapper,
             self.optim,
-            self.dl,
-            self.valid_dl
+            self.dl
         )
 
         # dataloader iterators
@@ -947,7 +1142,7 @@ class CoarseTransformerTrainer(nn.Module):
         self.valid_dl_iter = cycle(self.valid_dl)
 
         self.save_model_every = save_model_every
-        self.save_results_every = save_results_every    
+        self.save_results_every = save_results_every
 
         self.results_folder = Path(results_folder)
 
@@ -957,7 +1152,9 @@ class CoarseTransformerTrainer(nn.Module):
         self.results_folder.mkdir(parents = True, exist_ok = True)
 
         hps = {"num_train_steps": num_train_steps, "data_max_length": data_max_length, "learning_rate": lr}
-        self.accelerator.init_trackers("coarse", config=hps)        
+        self.tracker_hps = hps
+
+        self.accelerator.init_trackers("coarse", config=hps)
 
         self.train_wrapper.to(self.device)
         self.average_valid_loss_over_grad_accum_every = average_valid_loss_over_grad_accum_every
@@ -979,12 +1176,29 @@ class CoarseTransformerTrainer(nn.Module):
         # + 1 to start from the next step and avoid overwriting the last checkpoint
         self.steps = torch.tensor([checkpoint_num_steps(path) + 1], device=self.device)
 
-
     def print(self, msg):
         self.accelerator.print(msg)
 
     def generate(self, *args, **kwargs):
         return self.train_wrapper.generate(*args, **kwargs)
+
+    @contextmanager
+    def wandb_tracker(self, project, run = None, hps = None):
+        assert self.use_wandb_tracking, '`use_wandb_tracking` must be set to True on CoarseTransformerTrainer'
+
+        hps = default(hps, self.tracker_hps)
+
+        self.accelerator.init_trackers(project, config = None)
+
+        if exists(run):
+            wandb_tracker = find_first(lambda el: isinstance(el, WandBTracker), self.accelerator.trackers)
+            assert exists(wandb_tracker)
+
+            wandb_tracker.run.name = run
+
+        yield
+
+        self.accelerator.end_training()  
 
     @property
     def device(self):
@@ -1013,17 +1227,21 @@ class CoarseTransformerTrainer(nn.Module):
 
         logs = {}
 
-        # update vae (generator)
+        # update transformer
 
-        for _ in range(self.grad_accum_every):
+        for i in range(self.grad_accum_every):
+            is_last = i == (self.grad_accum_every - 1)
+            context = partial(self.accelerator.no_sync, self.train_wrapper) if not is_last else nullcontext
+
             data_kwargs = dict(zip(self.ds_fields, next(self.dl_iter)))
 
-            loss = self.train_wrapper(
-                **data_kwargs,
-                return_loss = True
-            )
+            with self.accelerator.autocast(), context():
+                loss = self.train_wrapper(
+                    **data_kwargs,
+                    return_loss = True
+                )
 
-            self.accelerator.backward(loss / self.grad_accum_every)
+                self.accelerator.backward(loss / self.grad_accum_every)
 
             accum_log(logs, {'loss': loss.item() / self.grad_accum_every})
 
@@ -1044,18 +1262,23 @@ class CoarseTransformerTrainer(nn.Module):
 
         if self.is_main and not (steps % self.save_results_every):
             valid_loss = 0
+            unwrapped_model = self.accelerator.unwrap_model(self.train_wrapper)
+
             for i in range(self.average_valid_loss_over_grad_accum_every):
                 data_kwargs = dict(zip(self.ds_fields, next(self.valid_dl_iter)))
+                data_kwargs = dict_values_to_device(data_kwargs, unwrapped_model.device)
 
-                with torch.inference_mode():
-                    self.train_wrapper.eval()
+                with torch.no_grad():
+                    unwrapped_model.eval()
 
-                    valid_loss += self.train_wrapper(
+                    valid_loss += unwrapped_model(
                         **data_kwargs,
                         return_loss = True
                     )
+
             valid_loss = valid_loss.clone() # avoid inference mode to non-inference mode error
             valid_loss /= self.average_valid_loss_over_grad_accum_every
+
             self.print(f'{steps}: valid loss {valid_loss}')
             self.accelerator.log({"valid_loss": valid_loss}, step=steps)
 
@@ -1064,10 +1287,13 @@ class CoarseTransformerTrainer(nn.Module):
         if self.is_main and not (steps % self.save_model_every):
             model_path = str(self.results_folder / f'coarse.transformer.{steps}.pt')
             self.save(model_path)
-
+            if self.use_wandb_tracking:
+                wandb.save(model_path)
             self.print(f'{steps}: saving model to {str(self.results_folder)}')
 
-        self.steps += 1
+        self.accelerator.wait_for_everyone()
+
+        self.steps.add_(1)
         return logs
 
     def train(self, log_fn = noop):
@@ -1091,6 +1317,7 @@ class FineTransformerTrainer(nn.Module):
         batch_size,
         audio_conditioner: Optional[AudioConditionerBase] = None,
         dataset: Optional[Dataset] = None,
+        valid_dataset: Optional[Dataset] = None,
         data_max_length = None,
         data_max_length_seconds = None,
         dataset_normalize = False,
@@ -1105,15 +1332,22 @@ class FineTransformerTrainer(nn.Module):
         save_model_every = 1000,
         results_folder = './results',
         accelerate_kwargs: dict = dict(),
+        init_process_group_timeout_seconds = 1800,
         split_batches = False,
         drop_last = False,
+        use_wandb_tracking = False,
         force_clear_prev_results = None,
         average_valid_loss_over_grad_accum_every: bool = True, # if False, valid loss on a single batch
     ):
         super().__init__()
         check_one_trainer()
+        self.use_wandb_tracking = use_wandb_tracking
+        if use_wandb_tracking:
+            accelerate_kwargs.update(log_with = 'wandb')
+        init_process_kwargs = InitProcessGroupKwargs(timeout = timedelta(seconds = init_process_group_timeout_seconds))
 
         self.accelerator = Accelerator(
+            kwargs_handlers = [DEFAULT_DDP_KWARGS, init_process_kwargs],
             split_batches = split_batches,
             **accelerate_kwargs
         )
@@ -1128,7 +1362,7 @@ class FineTransformerTrainer(nn.Module):
             audio_conditioner = audio_conditioner
         )
 
-        self.register_buffer('steps', torch.Tensor([0]))
+        self.register_buffer('steps', torch.tensor(0))
 
         self.num_train_steps = num_train_steps
         self.batch_size = batch_size
@@ -1165,14 +1399,17 @@ class FineTransformerTrainer(nn.Module):
 
         # split for validation
 
-        if valid_frac > 0:
-            train_size = int((1 - valid_frac) * len(self.ds))
-            valid_size = len(self.ds) - train_size
-            self.ds, self.valid_ds = random_split(self.ds, [train_size, valid_size], generator = torch.Generator().manual_seed(random_split_seed))
-            self.print(f'training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples')
-        else:
-            self.valid_ds = self.ds
-            self.print(f'training with shared training and valid dataset of {len(self.ds)} samples')
+        self.valid_ds = valid_dataset
+
+        if not exists(self.valid_ds):
+            if valid_frac > 0:
+                train_size = int((1 - valid_frac) * len(self.ds))
+                valid_size = len(self.ds) - train_size
+                self.ds, self.valid_ds = random_split(self.ds, [train_size, valid_size], generator = torch.Generator().manual_seed(random_split_seed))
+                self.print(f'training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples')
+            else:
+                self.valid_ds = self.ds
+                self.print(f'training with shared training and valid dataset of {len(self.ds)} samples')
 
         assert len(self.ds) >= batch_size, 'dataset must have sufficient samples for training'
         assert len(self.valid_ds) >= batch_size, f'validation dataset must have sufficient number of samples (currently {len(self.valid_ds)}) for training'
@@ -1188,13 +1425,11 @@ class FineTransformerTrainer(nn.Module):
         (
             self.transformer,
             self.optim,
-            self.dl,
-            self.valid_dl
+            self.dl
         ) = self.accelerator.prepare(
             self.transformer,
             self.optim,
-            self.dl,
-            self.valid_dl
+            self.dl
         )
 
         # dataloader iterators
@@ -1203,17 +1438,20 @@ class FineTransformerTrainer(nn.Module):
         self.valid_dl_iter = cycle(self.valid_dl)
 
         self.save_model_every = save_model_every
-        self.save_results_every = save_results_every    
+        self.save_results_every = save_results_every
 
         self.results_folder = Path(results_folder)
 
         if force_clear_prev_results is True or (not exists(force_clear_prev_results) and len([*self.results_folder.glob('**/*')]) > 0 and yes_or_no('do you want to clear previous experiment checkpoints and results?')):
             rmtree(str(self.results_folder))
 
+        self.accelerator.wait_for_everyone()
         self.results_folder.mkdir(parents = True, exist_ok = True)
 
         hps = {"num_train_steps": num_train_steps, "data_max_length": data_max_length, "learning_rate": lr}
-        self.accelerator.init_trackers("fine", config=hps)        
+        self.tracker_hps = hps
+
+        self.accelerator.init_trackers("fine", config=hps)
 
         self.train_wrapper.to(self.device)
         self.average_valid_loss_over_grad_accum_every = average_valid_loss_over_grad_accum_every
@@ -1240,6 +1478,24 @@ class FineTransformerTrainer(nn.Module):
 
     def generate(self, *args, **kwargs):
         return self.train_wrapper.generate(*args, **kwargs)
+
+    @contextmanager
+    def wandb_tracker(self, project, run = None, hps = None):
+        assert self.use_wandb_tracking, '`use_wandb_tracking` must be set to True on FineTransformerTrainer'
+
+        hps = default(hps, self.tracker_hps)
+
+        self.accelerator.init_trackers(project, config = None)
+
+        if exists(run):
+            wandb_tracker = find_first(lambda el: isinstance(el, WandBTracker), self.accelerator.trackers)
+            assert exists(wandb_tracker)
+
+            wandb_tracker.run.name = run
+
+        yield
+
+        self.accelerator.end_training() 
 
     @property
     def device(self):
@@ -1275,13 +1531,18 @@ class FineTransformerTrainer(nn.Module):
 
         logs = {}
 
-        # update vae (generator)
+        # update transformer
 
-        for _ in range(self.grad_accum_every):
+        for i in range(self.grad_accum_every):
+            is_last = i == (self.grad_accum_every - 1)
+            context = partial(self.accelerator.no_sync, self.train_wrapper) if not is_last else nullcontext
+
             data_kwargs = self.data_tuple_to_kwargs(next(self.dl_iter))
-            loss = self.train_wrapper(**data_kwargs, return_loss = True)
 
-            self.accelerator.backward(loss / self.grad_accum_every)
+            with self.accelerator.autocast(), context():
+                loss = self.train_wrapper(**data_kwargs, return_loss = True)
+
+                self.accelerator.backward(loss / self.grad_accum_every)
 
             accum_log(logs, {'loss': loss.item() / self.grad_accum_every})
 
@@ -1301,15 +1562,20 @@ class FineTransformerTrainer(nn.Module):
         self.accelerator.wait_for_everyone()
 
         if self.is_main and not (steps % self.save_results_every):
+            unwrapped_model = self.accelerator.unwrap_model(self.train_wrapper)
             valid_loss = 0
+
             for i in range(self.average_valid_loss_over_grad_accum_every):
                 data_kwargs = self.data_tuple_to_kwargs(next(self.valid_dl_iter))
+                data_kwargs = dict_values_to_device(data_kwargs, unwrapped_model.device)
 
                 with torch.inference_mode():
-                    self.train_wrapper.eval()
-                    valid_loss += self.train_wrapper(**data_kwargs, return_loss = True)
+                    unwrapped_model.eval()
+                    valid_loss += unwrapped_model(**data_kwargs, return_loss = True)
+
             valid_loss = valid_loss.clone() # avoid inference mode to non-inference mode error
             valid_loss /= self.average_valid_loss_over_grad_accum_every
+
             self.print(f'{steps}: valid loss {valid_loss}')
             self.accelerator.log({"valid_loss": valid_loss}, step=steps)
 
@@ -1318,10 +1584,13 @@ class FineTransformerTrainer(nn.Module):
         if self.is_main and not (steps % self.save_model_every):
             model_path = str(self.results_folder / f'fine.transformer.{steps}.pt')
             self.save(model_path)
-
+            if self.use_wandb_tracking:
+                wandb.save(model_path)
             self.print(f'{steps}: saving model to {str(self.results_folder)}')
 
-        self.steps += 1
+        self.accelerator.wait_for_everyone()
+
+        self.steps.add_(1)
         return logs
 
     def train(self, log_fn = noop):

@@ -126,6 +126,16 @@ def all_rows_have_eos_id(t, eos_id):
     eos_mask = (t == eos_id)
     return torch.any(eos_mask, dim = -1).all()
 
+def safe_cat(*tensors, dim = -2):
+    args = [*filter(exists, tensors)]
+
+    if len(args) == 0:
+        return None
+    elif len(args) == 1:
+        return args[0]
+    else:
+        return torch.cat(args, dim = dim)
+
 # classifier free guidance functions
 
 def prob_mask_like(shape, prob, device):
@@ -209,13 +219,17 @@ class RelativePositionBias(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def forward(self, n):
+    def forward(self, i, j):
+        assert j >= i
         device = self.device
-        pos = torch.arange(n, device = device)
-        rel_pos = (rearrange(pos, 'i -> i 1') - rearrange(pos, 'j -> 1 j'))
-        rel_pos += (n - 1)
 
-        x = torch.arange(-n + 1, n, device = device).float()
+        i_pos = torch.arange(i, device = device) + (j - i)
+        j_pos = torch.arange(j, device = device)
+
+        rel_pos = (rearrange(i_pos, 'i -> i 1') - rearrange(j_pos, 'j -> 1 j'))
+        rel_pos += (j - 1)
+
+        x = torch.arange(-j + 1, j, device = device).float()
         x = rearrange(x, '... -> ... 1')
 
         for layer in self.net:
@@ -294,7 +308,9 @@ class Attention(nn.Module):
         mask = None,
         attn_bias = None,
         prefix_context = None,
-        prefix_context_mask = None
+        prefix_context_mask = None,
+        return_kv_cache = False,
+        kv_cache = None
     ):
         b, n, _, device = *x.shape, x.device
 
@@ -329,6 +345,18 @@ class Attention(nn.Module):
 
         q, k, v = self.to_q(x), *self.to_kv(kv_input).chunk(2, dim = -1)
 
+        # kv cache
+
+        if exists(kv_cache):
+            ck, cv = kv_cache
+            k = torch.cat((ck, k), dim = -2)
+            v = torch.cat((cv, v), dim = -2)
+
+        # store kv cache
+
+        if return_kv_cache:
+            kv_cache = torch.stack((k, v))
+
         # null key / values
 
         if self.num_null_kv > 0:
@@ -352,7 +380,12 @@ class Attention(nn.Module):
         # merge heads
 
         out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
+        out = self.to_out(out)
+
+        if not return_kv_cache:
+            return out
+
+        return out, kv_cache
 
 # transformer
 
@@ -403,19 +436,48 @@ class Transformer(nn.Module):
         self_attn_mask = None,
         context = None,
         context_mask = None,
-        attn_bias = None
+        attn_bias = None,
+        return_kv_cache = False,
+        kv_cache = None
     ):
         assert not (self.cond_as_self_attn_prefix and not exists(context))
         assert not (exists(context) and context.shape[-1] != self.dim_context), f'you had specified a conditioning dimension of {self.dim_context}, yet what was received by the transformer has dimension of {context.shape[-1]}'
 
         n, device = x.shape[1], x.device
 
-        x = self.grad_shrink(x) # from cogview paper, adopted by GLM 130B LLM, decreases likelihood of attention net instability
+        # from cogview paper, adopted by GLM 130B LLM, decreases likelihood of attention net instability
+
+        x = self.grad_shrink(x)
+
+        # turn off kv cache if using conditioning as self attention (as in valle), for now
+
+        if self.cond_as_self_attn_prefix:
+            kv_cache = None
+
+        # handle kv cache
+
+        new_kv_cache = []
+
+        if exists(kv_cache):
+            cache_len = kv_cache.shape[-2]
+            kv_cache = iter(kv_cache)
+        else:
+            cache_len = 0
+            kv_cache = iter([])
+
+        x = x[:, cache_len:]
+
+        # relative positional bias
 
         if exists(attn_bias):
             rel_pos_bias = attn_bias
         else:
-            rel_pos_bias = maybe(self.rel_pos_bias)(n)
+            rel_pos_bias = maybe(self.rel_pos_bias)(n, n)
+
+        if exists(rel_pos_bias):
+            rel_pos_bias = rel_pos_bias[..., cache_len:, :]
+
+        # self attention kwargs
 
         self_attn_kwargs = dict()
         if self.cond_as_self_attn_prefix:
@@ -424,8 +486,16 @@ class Transformer(nn.Module):
                 prefix_context_mask = context_mask
             )
 
+        # transformer layers
+
         for attn, cross_attn, ff in self.layers:
-            x = attn(x, attn_bias = rel_pos_bias, mask = self_attn_mask, **self_attn_kwargs) + x
+
+            residual = x
+
+            attn_out, layer_kv_cache = attn(x, attn_bias = rel_pos_bias, mask = self_attn_mask, kv_cache = next(kv_cache, None), return_kv_cache = True, **self_attn_kwargs)
+            new_kv_cache.append(layer_kv_cache)
+
+            x = x + residual
 
             if exists(cross_attn):
                 assert exists(context)
@@ -434,7 +504,12 @@ class Transformer(nn.Module):
 
             x = ff(x) + x
 
-        return self.norm(x)
+        x = self.norm(x)
+
+        if not return_kv_cache:
+            return x
+
+        return x, torch.stack(new_kv_cache)
 
 # the three hierarchical transformers
 
@@ -518,15 +593,31 @@ class SemanticTransformer(nn.Module):
         self,
         *args,
         cond_scale = 3,
+        kv_cache = None,
+        return_kv_cache = False,
         **kwargs
     ):
-        logits = self.forward(*args, cond_drop_prob = 0., **kwargs)
+        kv_cache = iter(default(kv_cache, []))
+        new_kv_caches = []
+
+        logits, new_kv_cache = self.forward(*args, cond_drop_prob = 0., kv_cache = next(kv_cache, None), return_kv_cache = True, **kwargs)
+        new_kv_caches.append(new_kv_cache)
 
         if cond_scale == 1 or not self.has_condition:
-            return logits
+            if not return_kv_cache:
+                return logits
 
-        null_logits = self.forward(*args, cond_drop_prob = 1., **kwargs)
-        return null_logits + (logits - null_logits) * cond_scale
+            return logits, torch.stack(new_kv_caches)
+
+        null_logits, null_new_kv_cache = self.forward(*args, cond_drop_prob = 1., kv_cache = next(kv_cache, None), return_kv_cache = True, **kwargs)
+        new_kv_caches.append(null_new_kv_cache)
+
+        scaled_logits = null_logits + (logits - null_logits) * cond_scale
+
+        if not return_kv_cache:
+            return scaled_logits
+
+        return scaled_logits, torch.stack(new_kv_caches)
 
     @beartype
     def forward(
@@ -538,7 +629,9 @@ class SemanticTransformer(nn.Module):
         text_embeds = None,
         self_attn_mask = None,
         cond_drop_prob = None,
-        unique_consecutive = None
+        unique_consecutive = None,
+        kv_cache = None,
+        return_kv_cache = False
     ):
         device = self.device
 
@@ -574,8 +667,13 @@ class SemanticTransformer(nn.Module):
         if exists(self_attn_mask):
             self_attn_mask = F.pad(self_attn_mask, (1, 0), value = True)
 
-        tokens = self.transformer(tokens, context = text_embeds, self_attn_mask = self_attn_mask, context_mask = text_mask)
-        return self.to_logits(tokens)
+        tokens, kv_cache = self.transformer(tokens, context = text_embeds, self_attn_mask = self_attn_mask, context_mask = text_mask, kv_cache = kv_cache, return_kv_cache = True)
+        logits = self.to_logits(tokens)
+
+        if not return_kv_cache:
+            return logits
+
+        return logits, kv_cache
 
 class CoarseTransformer(nn.Module):
     @beartype
@@ -673,21 +771,40 @@ class CoarseTransformer(nn.Module):
         self,
         *args,
         cond_scale = 3,
+        return_kv_cache = False,
+        kv_cache = None,
+        embed_cache = None,
         **kwargs
     ):
-        semantic_logits, coarse_logits = self.forward(*args, cond_drop_prob = 0., **kwargs)
+        iter_kv_cache = iter(default(kv_cache, []))
+        iter_embed_cache = iter(default(embed_cache, []))
+        new_kv_caches = []
+        new_embed_caches = []
+
+        (semantic_logits, coarse_logits), (new_kv_cache, new_embed_cache) = self.forward(*args, cond_drop_prob = 0., return_cache = True, kv_cache = next(iter_kv_cache, None), embed_cache = next(iter_embed_cache, None), **kwargs)
+        new_kv_caches.append(new_kv_cache)
+        new_embed_caches.append(new_embed_cache)
 
         if cond_scale == 1 or not self.has_condition:
-            return semantic_logits, coarse_logits
+            if not return_kv_cache:
+                return semantic_logits, coarse_logits
 
-        null_semantic_logits, null_coarse_logits = self.forward(*args, cond_drop_prob = 1., **kwargs)
+            return (semantic_logits, coarse_logits), (torch.stack(new_kv_caches), torch.stack(new_embed_caches))
+
+        (null_semantic_logits, null_coarse_logits), (null_new_kv_cache, null_new_embed_cache) = self.forward(*args, cond_drop_prob = 1., return_cache = True, kv_cache = next(iter_kv_cache, None), embed_cache = next(iter_embed_cache, None), **kwargs)
+        new_kv_caches.append(null_new_kv_cache)
+        new_embed_caches.append(null_new_embed_cache)
 
         scaled_semantic_logits = None
         if exists(null_semantic_logits):
             scaled_semantic_logits = null_semantic_logits + (semantic_logits - null_semantic_logits) * cond_scale
 
         scaled_coarse_logits = null_coarse_logits + (coarse_logits - null_coarse_logits) * cond_scale
-        return scaled_semantic_logits, scaled_coarse_logits
+
+        if not return_kv_cache:
+            return scaled_semantic_logits, scaled_coarse_logits
+
+        return (scaled_semantic_logits, scaled_coarse_logits), (torch.stack(new_kv_caches), torch.stack(new_embed_caches))
 
     @beartype
     def forward(
@@ -699,7 +816,10 @@ class CoarseTransformer(nn.Module):
         text: Optional[List[str]] = None,
         text_embeds = None,
         cond_drop_prob = None,
-        return_only_coarse_logits = False
+        return_only_coarse_logits = False,
+        return_cache = False,
+        kv_cache = None,
+        embed_cache = None
     ):
         b, device = semantic_token_ids.shape[0], semantic_token_ids.device
         arange = partial(torch.arange, device = device)
@@ -756,7 +876,7 @@ class CoarseTransformer(nn.Module):
         attn_bias = None
 
         if exists(self.transformer.rel_pos_bias):
-            attn_bias = self.transformer.rel_pos_bias(seq_len)
+            attn_bias = self.transformer.rel_pos_bias(seq_len, seq_len)
 
             is_semantic = arange(seq_len) < (semantic_seq_len + 1) # semantic seq len + start token
             is_cross_attn = rearrange(is_semantic, 'i -> i 1') ^ rearrange(is_semantic, 'j -> 1 j')
@@ -769,13 +889,22 @@ class CoarseTransformer(nn.Module):
 
         # attend
 
-        tokens = self.transformer(
+        tokens, new_kv_cache = self.transformer(
             tokens,
             context = text_embeds,
             attn_bias = attn_bias,
             self_attn_mask = self_attn_mask,
-            context_mask = text_mask
+            context_mask = text_mask,
+            kv_cache = kv_cache,
+            return_kv_cache = True
         )
+
+        if exists(embed_cache):
+            tokens = torch.cat((embed_cache, tokens), dim = -2)
+
+        new_embed_cache = tokens
+
+        # segment into semantic and coarse acoustic tokens
 
         pred_semantic_tokens, pred_coarse_tokens = tokens[:, :semantic_seq_len], tokens[:, (semantic_seq_len + 1):]
 
@@ -805,7 +934,12 @@ class CoarseTransformer(nn.Module):
         else:
             coarse_logits = coarse_logits_groupable
 
-        return semantic_logits, coarse_logits
+        logits = (semantic_logits, coarse_logits)
+
+        if not return_cache:
+            return logits
+
+        return logits, (new_kv_cache, new_embed_cache)
 
 class FineTransformer(nn.Module):
     def __init__(
@@ -912,26 +1046,44 @@ class FineTransformer(nn.Module):
         self.load_state_dict(pkg['model'])
         return pkg
 
-
     def forward_with_cond_scale(
         self,
         *args,
         cond_scale = 3,
+        return_kv_cache = False,
+        kv_cache = None,
+        embed_cache = None,
         **kwargs
     ):
-        coarse_logits, fine_logits = self.forward(*args, cond_drop_prob = 0., **kwargs)
+        iter_kv_cache = iter(default(kv_cache, []))
+        iter_embed_cache = iter(default(embed_cache, []))
+        new_kv_caches = []
+        new_embed_caches = []
+
+        (semantic_logits, coarse_logits), (new_kv_cache, new_embed_cache) = self.forward(*args, cond_drop_prob = 0., return_cache = True, kv_cache = next(iter_kv_cache, None), embed_cache = next(iter_embed_cache, None), **kwargs)
+        new_kv_caches.append(new_kv_cache)
+        new_embed_caches.append(new_embed_cache)
 
         if cond_scale == 1 or not self.has_condition:
-            return coarse_logits, fine_logits
+            if not return_kv_cache:
+                return semantic_logits, coarse_logits
 
-        null_coarse_logits, null_fine_logits = self.forward(*args, cond_drop_prob = 1., **kwargs)
+            return (semantic_logits, coarse_logits), (torch.stack(new_kv_caches), torch.stack(new_embed_caches))
 
-        scaled_coarse_logits = None
-        if exists(null_coarse_logits):
-            scaled_coarse_logits =  null_coarse_logits + (coarse_logits - null_coarse_logits) * cond_scale
+        (null_semantic_logits, null_coarse_logits), (null_new_kv_cache, null_new_embed_cache) = self.forward(*args, cond_drop_prob = 1., return_cache = True, kv_cache = next(iter_kv_cache, None), embed_cache = next(iter_embed_cache, None), **kwargs)
+        new_kv_caches.append(null_new_kv_cache)
+        new_embed_caches.append(null_new_embed_cache)
 
-        scaled_fine_logits =  null_fine_logits + (fine_logits - null_fine_logits) * cond_scale
-        return scaled_coarse_logits, scaled_fine_logits
+        scaled_semantic_logits = None
+        if exists(null_semantic_logits):
+            scaled_semantic_logits = null_semantic_logits + (semantic_logits - null_semantic_logits) * cond_scale
+
+        scaled_coarse_logits = null_coarse_logits + (coarse_logits - null_coarse_logits) * cond_scale
+
+        if not return_kv_cache:
+            return scaled_semantic_logits, scaled_coarse_logits
+
+        return (scaled_semantic_logits, scaled_coarse_logits), (torch.stack(new_kv_caches), torch.stack(new_embed_caches))
 
     def forward(
         self,
@@ -941,6 +1093,9 @@ class FineTransformer(nn.Module):
         text_embeds = None,
         cond_drop_prob = None,
         self_attn_mask = None,
+        kv_cache = None,
+        embed_cache = None,
+        return_cache = False,
         return_only_fine_logits = False
     ):
         b, device = coarse_token_ids.shape[0], coarse_token_ids.device
@@ -1096,13 +1251,22 @@ class FineTransformer(nn.Module):
 
         # attention
 
-        tokens = self.transformer(
+        tokens, next_kv_cache = self.transformer(
             tokens,
             context = text_embeds,
             self_attn_mask = self_attn_mask,
             context_mask = text_mask,
-            attn_bias = attn_bias
+            attn_bias = attn_bias,
+            kv_cache = kv_cache,
+            return_kv_cache = True
         )
+
+        if exists(embed_cache):
+            tokens = torch.cat((embed_cache, tokens), dim = -2)
+
+        new_embed_cache = tokens
+
+        # figure out which tokens are coarse vs fine for logit projection
 
         pred_coarse_tokens, pred_fine_tokens = tokens[:, :n], tokens[:, (n + 1):]
 
@@ -1148,7 +1312,12 @@ class FineTransformer(nn.Module):
         else:
             fine_logits = fine_logits_groupable
 
-        return coarse_logits, fine_logits
+        logits = (coarse_logits, fine_logits)
+
+        if not return_cache:
+            return logits
+
+        return logits, (next_kv_cache, new_embed_cache)
 
 # training wrappers
 
@@ -1202,6 +1371,7 @@ class SemanticTransformerWrapper(nn.Module):
         cond_scale = 3,
         filter_thres = 0.9,
         temperature = 1.,
+        use_kv_cache = True,
         include_eos_in_output = True,  # if doing hierarchical sampling, eos must be kept for an easy time
         **kwargs
     ):
@@ -1248,16 +1418,29 @@ class SemanticTransformerWrapper(nn.Module):
 
         last_logit_indices = (ids != self.pad_id).sum(dim = -1).long()
 
+        # kv cache
+
+        kv_cache = None
+        logits = None
+
         # sample from transformer
 
         for ind in tqdm(range(start_length, max_length), desc = 'generating semantic'):
 
-            logits = self.transformer.forward_with_cond_scale(
+            new_logits, new_kv_cache = self.transformer.forward_with_cond_scale(
                 ids = sample_semantic_ids,
                 text_embeds = text_embeds,
                 cond_scale = cond_scale,
+                kv_cache = kv_cache,
+                return_kv_cache = True,
                 **kwargs
             )
+
+            if use_kv_cache:
+                kv_cache = new_kv_cache
+                logits = safe_cat(logits, new_logits, dim = -2)
+            else:
+                logits = new_logits
 
             last_logit_indices_expanded = repeat(last_logit_indices, 'b -> b 1 c', b = batch, c = logits.shape[-1])
             last_logits = logits.gather(1, last_logit_indices_expanded)
@@ -1391,6 +1574,7 @@ class CoarseTransformerWrapper(nn.Module):
         filter_thres = 0.9,
         temperature = 1.,
         reconstruct_wave = False,
+        use_kv_cache = True,
         **kwargs
     ):
         batch, device = semantic_token_ids.shape[0], self.device
@@ -1437,18 +1621,30 @@ class CoarseTransformerWrapper(nn.Module):
         init_coarse_time_step = 0
         sampled_coarse_token_ids = coarse_token_ids.clone()
 
+        # kv cache
+
+        kv_cache = None
+        embed_cache = None
+
         for time_step in tqdm(range(init_coarse_time_step, max_time_steps), desc = 'generating coarse'):
             for ind in range(self.num_coarse_quantizers):
                 just_finished_quantizer_step = (ind == 0 and time_step > 0)
 
-                _, coarse_logits = self.transformer.forward_with_cond_scale(
+                (_, coarse_logits), (next_kv_cache, next_embed_cache) = self.transformer.forward_with_cond_scale(
                     coarse_token_ids = sampled_coarse_token_ids,
                     semantic_token_ids = semantic_token_ids,
                     text_embeds = text_embeds,
                     cond_scale = cond_scale,
+                    return_kv_cache = True,
+                    kv_cache = kv_cache,
+                    embed_cache = embed_cache,
                     return_only_coarse_logits = True,
                     **kwargs
                 )
+
+                if use_kv_cache:
+                    kv_cache = next_kv_cache
+                    embed_cache = next_embed_cache
 
                 last_coarse_logits = coarse_logits[:, -1]
 
@@ -1469,8 +1665,31 @@ class CoarseTransformerWrapper(nn.Module):
 
         assert exists(self.codec)
 
-        wav = self.codec.decode_from_codebook_indices(sampled_coarse_token_ids)
-        return rearrange(wav, 'b 1 n -> b n')
+        coarse_tokens_are_variable_lengthed = (sampled_coarse_token_ids == -1).any()
+
+        if not coarse_tokens_are_variable_lengthed:
+            wav = self.codec.decode_from_codebook_indices(sampled_coarse_token_ids)
+            return rearrange(wav, 'b 1 n -> b n')
+
+        # handle variable lengthed coarse tokens
+
+        wavs = []
+        for coarse_sample in sampled_coarse_token_ids:
+            has_padding = reduce(coarse_sample == -1, 'n q -> n', 'any')
+            coarse_sample_without_padding = coarse_sample[~has_padding]
+
+            if has_padding.all():
+                wavs.append(None)
+                continue
+
+            coarse_sample_without_padding = rearrange(coarse_sample_without_padding, '... -> 1 ...')
+
+            wav = self.codec.decode_from_codebook_indices(coarse_sample_without_padding)
+            wav = rearrange(wav, '1 1 n -> n')
+
+            wavs.append(wav)
+
+        return wavs
 
     def forward(
         self,
@@ -1550,7 +1769,6 @@ class CoarseTransformerWrapper(nn.Module):
             text_embeds = text_embeds,
             **kwargs
         )
-
 
         # whether to early return the logits
 
@@ -1643,6 +1861,7 @@ class FineTransformerWrapper(nn.Module):
         filter_thres = 0.9,
         temperature = 1.,
         reconstruct_wave = False,
+        use_kv_cache = True,
         mask_out_generated_fine_tokens = False,
         **kwargs
     ):
@@ -1690,20 +1909,32 @@ class FineTransformerWrapper(nn.Module):
 
         sampled_fine_token_ids = fine_token_ids.clone()
 
+        # kv cache
+
+        kv_cache = None
+        embed_cache = None
+
         for time_step in tqdm(range(init_fine_time_step, max_time_steps), desc = 'generating fine'):
             for ind in range(self.num_fine_quantizers):
                 just_finished_quantizer_step = (ind == 0 and time_step > 0)
 
-                _, fine_logits = self.transformer.forward_with_cond_scale(
+                (_, fine_logits), (next_kv_cache, next_embed_cache) = self.transformer.forward_with_cond_scale(
                     coarse_token_ids = coarse_token_ids,
                     fine_token_ids = sampled_fine_token_ids,
                     text_embeds = text_embeds,
                     cond_scale = cond_scale,
                     return_only_fine_logits = True,
+                    kv_cache = kv_cache,
+                    embed_cache = embed_cache,
+                    return_kv_cache = True,
                     **kwargs
                 )
 
                 last_fine_logits = fine_logits[:, -1]
+
+                if use_kv_cache:
+                    kv_cache = next_kv_cache
+                    embed_cache = next_embed_cache
 
                 if not just_finished_quantizer_step:
                     last_fine_logits[:, -1] = float('-inf')  # prevent from eos in the middle of a time step
@@ -1738,8 +1969,26 @@ class FineTransformerWrapper(nn.Module):
 
         coarse_and_fine_ids = torch.cat((coarse_token_ids, sampled_fine_token_ids), dim = -1)
 
-        wav = self.codec.decode_from_codebook_indices(coarse_and_fine_ids)
-        return rearrange(wav, 'b 1 n -> b n')
+        # need to handle padding (uneven acoustic token lengths)
+
+        has_any_pad_mask = reduce(coarse_and_fine_ids == self.pad_id, 'b n q -> b n', 'any')
+
+        if not has_any_pad_mask.any():
+            wav = self.codec.decode_from_codebook_indices(coarse_and_fine_ids)
+            return rearrange(wav, 'b 1 n -> b n')
+
+        # naively decode each sample at a time if padding exists
+
+        wavs = []
+
+        for acoustic_ids_with_padding, pad_mask in zip(coarse_and_fine_ids, has_any_pad_mask):
+            acoustic_ids = acoustic_ids_with_padding[~pad_mask]
+            acoustic_ids = rearrange(acoustic_ids, 'n q -> 1 n q')
+            wav = self.codec.decode_from_codebook_indices(acoustic_ids)
+            wav = rearrange(wav, '1 1 n -> n')
+            wavs.append(wav)
+
+        return wavs
 
     def forward(
         self,

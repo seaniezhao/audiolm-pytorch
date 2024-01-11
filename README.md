@@ -65,11 +65,13 @@ Otherwise, to stay more true to the original paper, you can use `SoundStream`. F
 from audiolm_pytorch import SoundStream, SoundStreamTrainer
 
 soundstream = SoundStream(
-    codebook_size = 1024,
+    codebook_size = 4096,
     rq_num_quantizers = 8,
-    rq_groups = 2,                # this paper proposes using multi-headed residual vector quantization - https://arxiv.org/abs/2305.02765
-    attn_window_size = 128,       # local attention receptive field at bottleneck
-    attn_depth = 2                # 2 local attention transformer blocks - the soundstream folks were not experts with attention, so i took the liberty to add some. encodec went with lstms, but attention should be better
+    rq_groups = 2,                       # this paper proposes using multi-headed residual vector quantization - https://arxiv.org/abs/2305.02765
+    use_lookup_free_quantizer = True,    # whether to use residual lookup free quantization - there are now reports of successful usage of this unpublished technique
+    use_finite_scalar_quantizer = False, # whether to use residual finite scalar quantization
+    attn_window_size = 128,              # local attention receptive field at bottleneck
+    attn_depth = 2                       # 2 local attention transformer blocks - the soundstream folks were not experts with attention, so i took the liberty to add some. encodec went with lstms, but attention should be better
 )
 
 trainer = SoundStreamTrainer(
@@ -85,8 +87,30 @@ trainer.train()
 
 # after a lot of training, you can test the autoencoding as so
 
+soundstream.eval() # your soundstream must be in eval mode, to avoid having the residual dropout of the residual VQ necessary for training
+
 audio = torch.randn(10080).cuda()
 recons = soundstream(audio, return_recons_only = True) # (1, 10080) - 1 channel
+```
+
+Your trained `SoundStream` can then be used as a generic tokenizer for audio
+
+```python
+
+audio = torch.randn(1, 512 * 320)
+
+codes = soundstream.tokenize(audio)
+
+# you can now train anything with the codebook ids
+
+recon_audio_from_codes = soundstream.decode_from_codebook_indices(codes)
+
+# sanity check
+
+assert torch.allclose(
+    recon_audio_from_codes,
+    soundstream(audio, return_recons_only = True)
+)
 ```
 
 You can also use soundstreams that are specific to `AudioLM` and `MusicLM` by importing `AudioLMSoundStream` and `MusicLMSoundStream` respectively
@@ -105,6 +129,23 @@ As of version `0.17.0`, you can now invoke the class method on `SoundStream` to 
 from audiolm_pytorch import SoundStream
 
 soundstream = SoundStream.init_and_load_from('./path/to/checkpoint.pt')
+```
+
+To use <a href="https://wandb.ai">Weights & Biases</a> tracking, first set `use_wandb_tracking = True` on the `SoundStreamTrainer`, then do the following
+
+```python
+
+trainer = SoundStreamTrainer(
+    soundstream,
+    ...,
+    use_wandb_tracking = True
+)
+
+# wrap .train() with contextmanager, specifying project and run name
+
+with trainer.wandb_tracker(project = 'soundstream', run = 'baseline'):
+    trainer.train()
+
 ```
 
 ### Hierarchical Transformers
@@ -258,7 +299,7 @@ semantic_transformer = SemanticTransformer(
     cond_as_self_attn_prefix = True     # whether to condition as prefix to self attention, instead of cross attention, as was done in 'VALL-E' paper
 ).cuda()
 
-# mock text video dataset (as an example)
+# mock text audio dataset (as an example)
 
 # you will have to extend your own from `Dataset`, and return an audio tensor as well as a string (the audio description) in any order (the framework will autodetect and route it into the transformer)
 
@@ -343,6 +384,7 @@ $ accelerate launch train.py
 - [x] allow for grouped residual vq in soundstream (use `GroupedResidualVQ` from vector-quantize-pytorch lib), from <a href="https://arxiv.org/abs/2305.02765">hifi-codec</a>
 - [x] add flash attention with <a href="https://arxiv.org/abs/2305.19466">NoPE</a>
 - [x] accept prime wave in `AudioLM` as a path to an audio file, and auto resample for semantic vs acoustic
+- [x] add key / value caching to all transformers, speeding up inference
 
 - [ ] design a hierarchical coarse and fine transformer
 - [ ] investigate <a href="https://openreview.net/forum?id=H-VlwsYvVi">spec decoding</a>, first test in x-transformers, then port over if applicable
@@ -506,5 +548,25 @@ $ accelerate launch train.py
     author  = {Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
     booktitle = {Advances in Neural Information Processing Systems},
     year    = {2022}
+}
+```
+
+```bibtex
+@misc{yu2023language,
+    title   = {Language Model Beats Diffusion -- Tokenizer is Key to Visual Generation},
+    author  = {Lijun Yu and José Lezama and Nitesh B. Gundavarapu and Luca Versari and Kihyuk Sohn and David Minnen and Yong Cheng and Agrim Gupta and Xiuye Gu and Alexander G. Hauptmann and Boqing Gong and Ming-Hsuan Yang and Irfan Essa and David A. Ross and Lu Jiang},
+    year    = {2023},
+    eprint  = {2310.05737},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV}
+}
+```
+
+```bibtex
+@inproceedings{Katsch2023GateLoopFD,
+    title   = {GateLoop: Fully Data-Controlled Linear Recurrence for Sequence Modeling},
+    author  = {Tobias Katsch},
+    year    = {2023},
+    url     = {https://api.semanticscholar.org/CorpusID:265018962}
 }
 ```
